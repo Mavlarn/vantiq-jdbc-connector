@@ -11,6 +11,7 @@ package io.vantiq.extsrc.jdbcSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
@@ -85,7 +86,11 @@ public class JDBCMain {
         Properties properties = new Properties();
         
         try {
-            properties.load(JDBCMain.class.getClassLoader().getResourceAsStream(fileName));
+            if (fileName.startsWith("/") || fileName.startsWith("\\")) {
+                properties.load(new FileReader(fileName));
+            } else {
+                properties.load(JDBCMain.class.getClassLoader().getResourceAsStream(fileName));
+            }
         } catch (IOException e) {
             throw new RuntimeException("Could not find valid server configuration file.", e);
         } catch (Exception e) {

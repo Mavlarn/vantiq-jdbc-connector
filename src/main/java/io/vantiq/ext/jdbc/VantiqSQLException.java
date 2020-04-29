@@ -6,10 +6,10 @@
  * SPDX: MIT
  */
 
-package io.vantiq.extsrc.jdbcSource.exception;
+package io.vantiq.ext.jdbc;
 
 /**
- * An exception that signifies an image could not be found for an {@link ImageRetrieverInterface}
+ * A custom exception used to extract the useful information from a SQLException
  */
 public class VantiqSQLException extends Exception {
     

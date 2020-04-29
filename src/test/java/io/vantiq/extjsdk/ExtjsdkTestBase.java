@@ -12,9 +12,9 @@ package io.vantiq.extjsdk;
 //Author: Alex Blumer
 //Email: alex.j.blumer@gmail.com
 
-import java.util.function.Supplier;
-
 import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.util.function.Supplier;
 
 public class ExtjsdkTestBase {
 

@@ -6,53 +6,76 @@
  * SPDX: MIT
  */
 
-package io.vantiq.extsrc.jdbcSource;
+package io.vantiq.ext.jdbc;
 
-import java.sql.Connection;
-import java.sql.Date;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.ResultSetMetaData;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.sql.Time;
-import java.sql.Timestamp;
+import cn.ffcs.memory.Memory;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.sql.DataSource;
+import java.sql.*;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.HashMap;
-
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import io.vantiq.extsrc.jdbcSource.exception.VantiqSQLException;
+import java.util.List;
+import java.util.Map;
 
 public class JDBC {
-    Logger              log  = LoggerFactory.getLogger(this.getClass().getCanonicalName());
+
+    private static final Logger LOG  = LoggerFactory.getLogger(JDBC.class);
     private Connection  conn = null;
-    private Statement   stmt = null;
-    private ResultSet   rs   = null;    
+
+    // Boolean flag specifying if publish/query requests are handled synchronously, or asynchronously
+//    boolean isAsync;
     
+    // Used to reconnect if necessary
+    private String dbURL;
+    private String username;
+    private String password;
+    
+    // Timeout (in seconds) used to check if connection is still valid
+    private static final int CHECK_CONNECTION_TIMEOUT = 5;
+
+    // Timeout (in milliseconds) specifying how long ds.getConnection() will wait for a connection before timing out
+    private static final int CONNECTION_POOL_TIMEOUT = 5000;
+
+    // Used if asynchronous publish/query handling has been specified
+    private HikariDataSource ds;
+    private Memory memory;
+
     DateFormat dfTimestamp  = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSSZ");
     DateFormat dfDate       = new SimpleDateFormat("yyyy-MM-dd");
     DateFormat dfTime       = new SimpleDateFormat("HH:mm:ss.SSSZ");
-    
+
     /**
      * The method used to setup the connection to the SQL Database, using the values retrieved from the source config.
-     * @param dbURL         The Database URL to be used to connect to the SQL Database.    
-     * @param username      The username to be used to connect to the SQL Database.
-     * @param password      The password to be used to connect to the SQL Database.
-     * @throws VantiqSQLException 
      */
-    public void setupJDBC(String dbURL, String username, String password) throws VantiqSQLException {        
-        try {
-            // Open a connection
-            conn = DriverManager.getConnection(dbURL,username,password);
-            
-        } catch (SQLException e) {
-            // Handle errors for JDBC
-            reportSQLError(e);
-        } 
+    public JDBC(JDBCConnectorConfig config) {
+
+        // Save login credentials for reconnection if necessary
+        this.dbURL = config.getDbURL();
+        this.username = config.getUsername();
+        this.password = config.getPassword();
+
+        // Create a connection pool
+        HikariConfig connectionPoolConfig = new HikariConfig();
+        connectionPoolConfig.setJdbcUrl(dbURL);
+        if (username != null) {
+            connectionPoolConfig.setUsername(username);
+        }
+        if (password != null) {
+            connectionPoolConfig.setPassword(password);
+        }
+        ds = new HikariDataSource(connectionPoolConfig);
+        ds.setConnectionTimeout(CONNECTION_POOL_TIMEOUT);
+
+        // Setting max pool size (should always match number of active threads for publish and query)
+        ds.setMaximumPoolSize(config.getPoolSize());
+
+        memory = new Memory(ds);
     }
     
     /**
@@ -64,34 +87,69 @@ public class JDBC {
      */
     public HashMap[] processQuery(String sqlQuery) throws VantiqSQLException {
         HashMap[] rsArray = null;
-        try (Statement stmt = conn.createStatement();
-                ResultSet rs = stmt.executeQuery(sqlQuery)) {
-            this.stmt = stmt;
-            this.rs = rs;
-            rsArray = createMapFromResults(rs);           
+
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement();
+             ResultSet rs = stmt.executeQuery(sqlQuery)) {
+            rsArray = createMapFromResults(rs);
         } catch (SQLException e) {
             // Handle errors for JDBC
             reportSQLError(e);
-        } 
+        }
+
         return rsArray;
     }
     
     /**
-     * The method used to execute the provided query, triggered by a PUBLISH on the respective source from VANTIQ.
+     * The method used to execute the provided query, triggered by a PUBLISH on the respective VANTIQ source.
      * @param sqlQuery          A String representation of the query, retrieved from the PUBLISH message.
      * @return                  The integer value that is returned by the executeUpdate() method representing the row count.
      * @throws VantiqSQLException
      */
     public int processPublish(String sqlQuery) throws VantiqSQLException {
         int publishSuccess = -1;
-        try (Statement stmt = conn.createStatement()) {
-            this.stmt = stmt;
+
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
             publishSuccess = stmt.executeUpdate(sqlQuery);
-            
         } catch (SQLException e) {
             // Handle errors for JDBC
             reportSQLError(e);
-        } 
+        }
+
+        return publishSuccess;
+    }
+
+    public int processInsert(String table, Map data) {
+        return memory.create(table, data);
+    }
+
+    /**
+     * The method used to execute the provided list of queries, triggered by a PUBLISH on the respective VANTIQ source. These queries
+     * are processed as a batch.
+     * @param queryList             The list of queries to be processed as a batch.
+     * @return
+     * @throws VantiqSQLException
+     * @throws ClassCastException
+     */
+    public int[] processBatchPublish(List queryList) throws VantiqSQLException, ClassCastException {
+        int[] publishSuccess = null;
+
+        try (Connection conn = ds.getConnection();
+             Statement stmt = conn.createStatement()) {
+
+            // Adding queries into batch
+            for (int i = 0; i < queryList.size(); i++) {
+                stmt.addBatch((String) queryList.get(i));
+            }
+
+            // Executing the batch
+            publishSuccess = stmt.executeBatch();
+        } catch (SQLException e) {
+            // Handle errors for JDBC
+            reportSQLError(e);
+        }
+
         return publishSuccess;
     }
     
@@ -118,24 +176,24 @@ public class JDBC {
                         // Check column type to retrieve data in appropriate manner
                         int columnType = md.getColumnType(i);
                         switch (columnType) {
-                            case java.sql.Types.DECIMAL:
+                            case Types.DECIMAL:
                                 if (queryResults.getBigDecimal(i) != null) {
                                     row.put(md.getColumnName(i), queryResults.getBigDecimal(i));
                                 }
                                 break;
-                            case java.sql.Types.DATE:
+                            case Types.DATE:
                                 Date rowDate = queryResults.getDate(i);
                                 if (rowDate != null) {
                                     row.put(md.getColumnName(i), dfDate.format(rowDate));
                                 }
                                 break;
-                            case java.sql.Types.TIME:
+                            case Types.TIME:
                                 Time rowTime = queryResults.getTime(i);
                                 if (rowTime != null) {
                                     row.put(md.getColumnName(i), dfTime.format(rowTime));
                                 }
                                 break;
-                            case java.sql.Types.TIMESTAMP:
+                            case Types.TIMESTAMP:
                                 Timestamp rowTimestamp = queryResults.getTimestamp(i);
                                 if (rowTimestamp != null) {
                                     row.put(md.getColumnName(i), dfTimestamp.format(rowTimestamp));
@@ -161,6 +219,21 @@ public class JDBC {
     }
     
     /**
+     * Method used to try and reconnect if database connection was lost. Used for synchronous processing (connection pool handles this internally).
+     * @throws VantiqSQLException
+     */
+    public void diagnoseConnection() throws VantiqSQLException {
+        try {
+            if (!conn.isValid(CHECK_CONNECTION_TIMEOUT)) {
+                conn = DriverManager.getConnection(dbURL,username,password);
+            }
+        } catch (SQLException e) {
+            // Handle errors for JDBC
+            reportSQLError(e);
+        }
+    }
+    
+    /**
      * Method used to throw the VantiqSQLException whenever is necessary
      * @param e The SQLException caught by the calling method
      * @throws VantiqSQLException
@@ -170,52 +243,26 @@ public class JDBC {
                 " SQL State: " + e.getSQLState() + ", Error Code: " + e.getErrorCode();
         throw new VantiqSQLException(message);
     }
-    
-    /**
-     * Calls the close functions for the SQL ResultSet, Statement, and Connection.
-     */
-    public void close() {
-        closeResultSet();
-        closeStatement();
-        closeConnection();
+
+    public DataSource getDataSource() {
+        return ds;
     }
-    
-    /**
-     * Closes the SQL ResultSet.
-     */
-    public void closeResultSet() {
-        try {
-            if (rs!=null) {
-                rs.close();
-            }
-        } catch(SQLException e) {
-            log.error("A error occurred when closing the ResultSet: ", e);
-        }
-    }
-    
-    /**
-     * Closes the SQL Statement.
-     */
-    public void closeStatement() {
-        try {
-            if (stmt!=null) {
-                stmt.close();
-            }
-        } catch(SQLException e) {
-            log.error("A error occurred when closing the Statement: ", e);
-        }
-    }
-    
+
     /**
      * Closes the SQL Connection.
      */
-    public void closeConnection() {
+    public void close() {
+        // Close single connection if open
         try {
             if (conn!=null) {
                 conn.close();
             }
         } catch(SQLException e) {
-            log.error("A error occurred when closing the Connection: ", e);
+            LOG.error("A error occurred when closing the Connection: ", e);
+        }
+        // Close connection pool if open
+        if (ds != null) {
+            ds.close();
         }
     }
 }

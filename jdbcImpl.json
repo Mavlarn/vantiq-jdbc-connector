@@ -1,5 +1,5 @@
 {
-   "name" : "JDBC",
+   "name" : "JDBCSource",
    "baseType" : "EXTENSION",
    "verticle" : "service:extensionSource",
    "config" : {}
